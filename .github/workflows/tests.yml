@@ -128,3 +128,13 @@ jobs:
         with:
           user: __token__
           password: ${{ secrets.PYPI_TOKEN }}
+
+  on:
+    push:
+      branches:
+        - rtp
+      tags:
+        - v1
+      # file paths to consider in the event. Optional; defaults to all.
+      paths:
+        - 'tests/*'
