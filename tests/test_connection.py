@@ -3,7 +3,7 @@ import binascii
 import contextlib
 import io
 import time
-from unittest import TestCase
+from unittest import TestCase, skipIf
 
 from aioquic import tls
 from aioquic.buffer import UINT_VAR_MAX, Buffer, encode_uint_var
@@ -21,8 +21,10 @@ from aioquic.quic.packet import (
     PACKET_TYPE_INITIAL,
     QuicErrorCode,
     QuicFrameType,
+    QuicTransportParameters,
     encode_quic_retry,
     encode_quic_version_negotiation,
+    push_quic_transport_parameters,
 )
 from aioquic.quic.packet_builder import QuicDeliveryState, QuicPacketBuilder
 from aioquic.quic.recovery import QuicPacketPacer
@@ -32,6 +34,7 @@ from .utils import (
     SERVER_CERTFILE,
     SERVER_CERTFILE_WITH_CHAIN,
     SERVER_KEYFILE,
+    SKIP_TESTS,
 )
 
 CLIENT_ADDR = ("1.2.3.4", 1234)
@@ -109,7 +112,11 @@ def client_and_server(
     )
     server_configuration.load_cert_chain(server_certfile, server_keyfile)
 
-    server = QuicConnection(configuration=server_configuration, **server_kwargs)
+    server = QuicConnection(
+        configuration=server_configuration,
+        original_destination_connection_id=client.original_destination_connection_id,
+        **server_kwargs
+    )
     server._ack_delay = 0
     disable_packet_pacing(server)
     server_patch(server)
@@ -133,6 +140,12 @@ def disable_packet_pacing(connection):
             return None
 
     connection._loss._pacer = DummyPacketPacer()
+
+
+def encode_transport_parameters(parameters: QuicTransportParameters) -> bytes:
+    buf = Buffer(capacity=512)
+    push_quic_transport_parameters(buf, parameters)
+    return buf.data
 
 
 def sequence_numbers(connection_ids):
@@ -278,6 +291,54 @@ class QuicConnectionTest(TestCase):
             # check handshake completed
             self.check_handshake(client=client, server=server)
 
+    def test_connect_with_cipher_suite_aes128(self):
+        with client_and_server(
+            client_options={"cipher_suites": [tls.CipherSuite.AES_128_GCM_SHA256]}
+        ) as (client, server):
+            # check handshake completed
+            self.check_handshake(client=client, server=server)
+
+            # check selected cipher suite
+            self.assertEqual(
+                client.tls.key_schedule.cipher_suite, tls.CipherSuite.AES_128_GCM_SHA256
+            )
+            self.assertEqual(
+                server.tls.key_schedule.cipher_suite, tls.CipherSuite.AES_128_GCM_SHA256
+            )
+
+    def test_connect_with_cipher_suite_aes256(self):
+        with client_and_server(
+            client_options={"cipher_suites": [tls.CipherSuite.AES_256_GCM_SHA384]}
+        ) as (client, server):
+            # check handshake completed
+            self.check_handshake(client=client, server=server)
+
+            # check selected cipher suite
+            self.assertEqual(
+                client.tls.key_schedule.cipher_suite, tls.CipherSuite.AES_256_GCM_SHA384
+            )
+            self.assertEqual(
+                server.tls.key_schedule.cipher_suite, tls.CipherSuite.AES_256_GCM_SHA384
+            )
+
+    @skipIf("chacha20" in SKIP_TESTS, "Skipping chacha20 tests")
+    def test_connect_with_cipher_suite_chacha20(self):
+        with client_and_server(
+            client_options={"cipher_suites": [tls.CipherSuite.CHACHA20_POLY1305_SHA256]}
+        ) as (client, server):
+            # check handshake completed
+            self.check_handshake(client=client, server=server)
+
+            # check selected cipher suite
+            self.assertEqual(
+                client.tls.key_schedule.cipher_suite,
+                tls.CipherSuite.CHACHA20_POLY1305_SHA256,
+            )
+            self.assertEqual(
+                server.tls.key_schedule.cipher_suite,
+                tls.CipherSuite.CHACHA20_POLY1305_SHA256,
+            )
+
     def test_connect_with_loss_1(self):
         """
         Check connection is established even in the client's INITIAL is lost.
@@ -295,7 +356,10 @@ class QuicConnectionTest(TestCase):
         server_configuration = QuicConfiguration(is_client=False)
         server_configuration.load_cert_chain(SERVER_CERTFILE, SERVER_KEYFILE)
 
-        server = QuicConnection(configuration=server_configuration)
+        server = QuicConnection(
+            configuration=server_configuration,
+            original_destination_connection_id=client.original_destination_connection_id,
+        )
         server._ack_delay = 0
 
         # client sends INITIAL
@@ -316,7 +380,7 @@ class QuicConnectionTest(TestCase):
         now = 1.1
         server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
         items = server.datagrams_to_send(now=now)
-        self.assertEqual(datagram_sizes(items), [1280, 1062])
+        self.assertEqual(datagram_sizes(items), [1280, 1050])
         self.assertEqual(server.get_timer(), 2.1)
         self.assertEqual(len(server._loss.spaces[0].sent_packets), 1)
         self.assertEqual(len(server._loss.spaces[1].sent_packets), 2)
@@ -363,7 +427,10 @@ class QuicConnectionTest(TestCase):
         server_configuration = QuicConfiguration(is_client=False)
         server_configuration.load_cert_chain(SERVER_CERTFILE, SERVER_KEYFILE)
 
-        server = QuicConnection(configuration=server_configuration)
+        server = QuicConnection(
+            configuration=server_configuration,
+            original_destination_connection_id=client.original_destination_connection_id,
+        )
         server._ack_delay = 0
 
         # client sends INITIAL
@@ -377,7 +444,7 @@ class QuicConnectionTest(TestCase):
         now = 0.1
         server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
         items = server.datagrams_to_send(now=now)
-        self.assertEqual(datagram_sizes(items), [1280, 1062])
+        self.assertEqual(datagram_sizes(items), [1280, 1050])
         self.assertEqual(server.get_timer(), 1.1)
         self.assertEqual(len(server._loss.spaces[0].sent_packets), 1)
         self.assertEqual(len(server._loss.spaces[1].sent_packets), 2)
@@ -413,7 +480,7 @@ class QuicConnectionTest(TestCase):
         now = server.get_timer()
         server.handle_timer(now=now)
         items = server.datagrams_to_send(now=now)
-        self.assertEqual(datagram_sizes(items), [1280, 854])
+        self.assertEqual(datagram_sizes(items), [1280, 874])
         self.assertAlmostEqual(server.get_timer(), 3.1)
         self.assertEqual(len(server._loss.spaces[0].sent_packets), 0)
         self.assertEqual(len(server._loss.spaces[1].sent_packets), 3)
@@ -456,7 +523,10 @@ class QuicConnectionTest(TestCase):
         server_configuration = QuicConfiguration(is_client=False)
         server_configuration.load_cert_chain(SERVER_CERTFILE, SERVER_KEYFILE)
 
-        server = QuicConnection(configuration=server_configuration)
+        server = QuicConnection(
+            configuration=server_configuration,
+            original_destination_connection_id=client.original_destination_connection_id,
+        )
         server._ack_delay = 0
 
         # client sends INITIAL
@@ -470,7 +540,7 @@ class QuicConnectionTest(TestCase):
         now = 0.1
         server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
         items = server.datagrams_to_send(now=now)
-        self.assertEqual(datagram_sizes(items), [1280, 1062])
+        self.assertEqual(datagram_sizes(items), [1280, 1050])
         self.assertEqual(server.get_timer(), 1.1)
         self.assertEqual(len(server._loss.spaces[0].sent_packets), 1)
         self.assertEqual(len(server._loss.spaces[1].sent_packets), 2)
@@ -1482,6 +1552,65 @@ class QuicConnectionTest(TestCase):
                 Buffer(data=b"\x00"),
             )
 
+    def test_parse_transport_parameters(self):
+        client = create_standalone_client(self)
+
+        data = encode_transport_parameters(
+            QuicTransportParameters(
+                original_destination_connection_id=client.original_destination_connection_id
+            )
+        )
+        client._parse_transport_parameters(data)
+
+    def test_parse_transport_parameters_with_bad_active_connection_id_limit(self):
+        client = create_standalone_client(self)
+
+        for active_connection_id_limit in [0, 1]:
+            data = encode_transport_parameters(
+                QuicTransportParameters(
+                    active_connection_id_limit=active_connection_id_limit,
+                    original_destination_connection_id=client.original_destination_connection_id,
+                )
+            )
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._parse_transport_parameters(data)
+            self.assertEqual(
+                cm.exception.error_code, QuicErrorCode.TRANSPORT_PARAMETER_ERROR
+            )
+            self.assertEqual(cm.exception.frame_type, QuicFrameType.CRYPTO)
+            self.assertEqual(
+                cm.exception.reason_phrase,
+                "active_connection_id_limit must be no less than 2",
+            )
+
+    def test_parse_transport_parameters_with_server_only_parameter(self):
+        server_configuration = QuicConfiguration(
+            is_client=False, quic_logger=QuicLogger()
+        )
+        server_configuration.load_cert_chain(SERVER_CERTFILE, SERVER_KEYFILE)
+
+        server = QuicConnection(
+            configuration=server_configuration,
+            original_destination_connection_id=bytes(8),
+        )
+        for active_connection_id_limit in [0, 1]:
+            data = encode_transport_parameters(
+                QuicTransportParameters(
+                    active_connection_id_limit=active_connection_id_limit,
+                    original_destination_connection_id=bytes(8),
+                )
+            )
+            with self.assertRaises(QuicConnectionError) as cm:
+                server._parse_transport_parameters(data)
+            self.assertEqual(
+                cm.exception.error_code, QuicErrorCode.TRANSPORT_PARAMETER_ERROR
+            )
+            self.assertEqual(cm.exception.frame_type, QuicFrameType.CRYPTO)
+            self.assertEqual(
+                cm.exception.reason_phrase,
+                "original_destination_connection_id is not allowed for clients",
+            )
+
     def test_payload_received_padding_only(self):
         with client_and_server() as (client, server):
             # client receives padding only
@@ -1620,6 +1749,16 @@ class QuicConnectionTest(TestCase):
             self.assertEqual(type(event), events.PingAcknowledged)
             self.assertEqual(event.uid, 12345)
 
+    def test_send_reset_stream(self):
+        with client_and_server() as (client, server):
+            # client creates bidirectional stream
+            client.send_stream_data(0, b"hello")
+            self.assertEqual(roundtrip(client, server), (1, 1))
+
+            # client resets stream
+            client.reset_stream(0, QuicErrorCode.NO_ERROR)
+            self.assertEqual(roundtrip(client, server), (1, 1))
+
     def test_send_stream_data_over_max_streams_bidi(self):
         with client_and_server() as (client, server):
             # create streams
@@ -1692,11 +1831,26 @@ class QuicConnectionTest(TestCase):
             client.send_stream_data(1, b"hello")
             self.assertEqual(roundtrip(client, server), (1, 1))
 
-            # client create unidirectional stream
+            # client creates unidirectional stream
             client.send_stream_data(2, b"hello")
             self.assertEqual(roundtrip(client, server), (1, 1))
 
-            # client tries to send data on server-initial unidirectional stream
+            # client tries to reset server-initiated unidirectional stream
+            with self.assertRaises(ValueError) as cm:
+                client.reset_stream(3, QuicErrorCode.NO_ERROR)
+            self.assertEqual(
+                str(cm.exception),
+                "Cannot send data on peer-initiated unidirectional stream",
+            )
+
+            # client tries to reset unknown server-initiated bidirectional stream
+            with self.assertRaises(ValueError) as cm:
+                client.reset_stream(5, QuicErrorCode.NO_ERROR)
+            self.assertEqual(
+                str(cm.exception), "Cannot send data on unknown peer-initiated stream"
+            )
+
+            # client tries to send data on server-initiated unidirectional stream
             with self.assertRaises(ValueError) as cm:
                 client.send_stream_data(3, b"hello")
             self.assertEqual(
@@ -1775,6 +1929,40 @@ class QuicConnectionTest(TestCase):
             now=time.time(),
         )
         self.assertEqual(drop(client), 1)
+
+    def test_write_connection_close_early(self):
+        client = create_standalone_client(self)
+
+        builder = QuicPacketBuilder(
+            host_cid=client.host_cid,
+            is_client=True,
+            peer_cid=client._peer_cid,
+            version=client._version,
+        )
+        crypto = CryptoPair()
+        crypto.setup_initial(client.host_cid, is_client=True, version=client._version)
+        builder.start_packet(PACKET_TYPE_INITIAL, crypto)
+        client._write_connection_close_frame(
+            builder=builder,
+            epoch=tls.Epoch.INITIAL,
+            error_code=123,
+            frame_type=None,
+            reason_phrase="some reason",
+        )
+
+        self.assertEqual(
+            builder.quic_logger_frames,
+            [
+                {
+                    "error_code": QuicErrorCode.APPLICATION_ERROR,
+                    "error_space": "transport",
+                    "frame_type": "connection_close",
+                    "raw_error_code": QuicErrorCode.APPLICATION_ERROR,
+                    "reason": "",
+                    "trigger_frame_type": QuicFrameType.PADDING,
+                }
+            ],
+        )
 
 
 class QuicNetworkPathTest(TestCase):
